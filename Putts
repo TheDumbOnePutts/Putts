@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Putt Tracker</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }
+    h1 { margin-bottom: 8px; }
+    input, select { padding: 6px; margin: 5px; }
+    button { padding: 8px 12px; margin: 4px; font-size: 14px; cursor: pointer; }
+    label { cursor: pointer; }
+    canvas { max-width: 420px; margin: 16px auto; display: block; }
+    #controls { margin-top: 10px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+    table { border-collapse: collapse; margin: 12px auto; }
+    th, td { border: 1px solid #ccc; padding: 6px 10px; }
+    .row { display:flex; flex-wrap:wrap; gap:20px; justify-content:center; }
+    .card { max-width: 460px; flex: 1 1 320px; }
+    .clubbar { display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:8px; margin-bottom: 10px; }
+    .muted { color:#666; font-size:12px; }
+  </style>
+</head>
+<body>
+  <h1>⛳ Putt Tracker</h1>
+
+  <!-- Club selector + manager -->
+  <div class="clubbar">
+    <strong>Putter:</strong>
+    <select id="clubSelect"></select>
+    <input type="text" id="newClubInput" placeholder="Add new putter name" />
+    <button id="addClubBtn">Add Club</button>
+    <button id="deleteClubBtn" title="Delete selected club">Delete Club</button>
+  </div>
+  <div class="muted" id="clubHint">Stats below show: <span id="activeClubLabel"></span></div>
+
+  <!-- Distance + tap-to-log -->
+  <div>
+    <label for="distance">Distance (ft): </label>
+    <input type="number" id="distance" min="1" max="100" placeholder="2, 4, 6, 8" />
+  </div>
+
+  <p>🎯 Tap inside the circle for <b>Made</b>, outside for miss direction. Toggle quadrants to visualize Left / Right / Long (top) / Short (bottom).</p>
+  <label>
+    <input type="checkbox" id="toggleQuadrants" checked />
+    Show miss quadrants (Left / Right / Long / Short)
+  </label>
+
+  <canvas id="cupCanvas" width="280" height="280"></canvas>
+
+  <div id="controls">
+    <button id="resetClubBtn">🔄 Reset Current View</button>
+    <button id="exportBtn">📤 Export CSV (Current View)</button>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <canvas id="missChart"></canvas>
+    </div>
+    <div class="card">
+      <canvas id="quadBarChart"></canvas>
+    </div>
+  </div>
+
+  <h3>Make % by Distance (Current View)</h3>
+  <table>
+    <thead>
+      <tr><th>Distance</th><th>Makes</th><th>Total</th><th>Make %</th></tr>
+    </thead>
+    <tbody id="distanceStats"></tbody>
+  </table>
+
+  <h3>🔁 Per-Club Comparison</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Club</th>
+        <th>Total Makes</th>
+        <th>Total Attempts</th>
+        <th>Make %</th>
+        <th>2 ft %</th>
+        <th>4 ft %</th>
+        <th>6 ft %</th>
+        <th>8 ft %</th>
+      </tr>
+    </thead>
+    <tbody id="clubCompareBody"></tbody>
+  </table>
+
+  <script>
+    /* =========================
+       Persistent data & schema
+       ========================= */
+    // Each putt: { distance:number|"?", result:string, time:string, club:string, dx:number, dy:number }
+    let putts = JSON.parse(localStorage.getItem("putts_v2")) || migrateOldData();
+
+    // Clubs list (stored), active selection (can be a real club or "__ALL__")
+    let clubs = JSON.parse(localStorage.getItem("clubs")) || ["Default"];
+    const ALL = "__ALL__";
+    let activeClub = localStorage.getItem("activeClub") || clubs[0];
+
+    const trackedDistances = [2, 4, 6, 8];
+
+    // DOM refs
+    const clubSelect = document.getElementById("clubSelect");
+    const newClubInput = document.getElementById("newClubInput");
+    const addClubBtn = document.getElementById("addClubBtn");
+    const deleteClubBtn = document.getElementById("deleteClubBtn");
+    const activeClubLabel = document.getElementById("activeClubLabel");
+    const resetClubBtn = document.getElementById("resetClubBtn");
+    const exportBtn = document.getElementById("exportBtn");
+
+    /* =========================
+       Cup drawing + tap handler
+       ========================= */
+    const cupCanvas = document.getElementById("cupCanvas");
+    const ctxCup = cupCanvas.getContext("2d");
+    const cupX = cupCanvas.width / 2;
+    const cupY = cupCanvas.height / 2;
+    const cupRadius = 36; // larger for easier tapping
+    const toggleQuadrants = document.getElementById("toggleQuadrants");
+
+    function drawCup() {
+      ctxCup.clearRect(0, 0, cupCanvas.width, cupCanvas.height);
+
+      if (toggleQuadrants.checked) drawQuadrants();
+
+      // Crosshair
+      ctxCup.strokeStyle = "#666";
+      ctxCup.lineWidth = 1;
+      ctxCup.beginPath();
+      ctxCup.moveTo(0, cupY); ctxCup.lineTo(cupCanvas.width, cupY);
+      ctxCup.moveTo(cupX, 0); ctxCup.lineTo(cupX, cupCanvas.height);
+      ctxCup.stroke();
+
+      // Cup
+      ctxCup.beginPath();
+      ctxCup.arc(cupX, cupY, cupRadius, 0, Math.PI * 2);
+      ctxCup.fillStyle = "#4caf50";
+      ctxCup.fill();
+      ctxCup.strokeStyle = "#222";
+      ctxCup.lineWidth = 2;
+      ctxCup.stroke();
+
+      // Labels (Long on top, Short on bottom)
+      ctxCup.fillStyle = "#000";
+      ctxCup.font = "12px Arial";
+      ctxCup.fillText("Long", cupX - 16, 16);
+      ctxCup.fillText("Short", cupX - 18, cupCanvas.height - 6);
+      ctxCup.fillText("Left", 6, cupY - 8);
+      ctxCup.fillText("Right", cupCanvas.width - 36, cupY - 8);
+    }
+
+    function drawQuadrants() {
+      const r = Math.min(cupCanvas.width, cupCanvas.height)/2 - 6;
+      const fills = [
+        // left half
+        { start: Math.PI/2, end: 3*Math.PI/2, color: "rgba(33,150,243,0.10)" },
+        // right half
+        { start: -Math.PI/2, end: Math.PI/2, color: "rgba(66,66,66,0.10)" },
+        // Top (Long)
+        { start: Math.PI, end: 2*Math.PI, color: "rgba(156,39,176,0.10)" },
+        // Bottom (Short)
+        { start: 0, end: Math.PI, color: "rgba(255,152,0,0.10)" }
+      ];
+      fills.forEach(f => {
+        ctxCup.beginPath();
+        ctxCup.moveTo(cupX, cupY);
+        ctxCup.arc(cupX, cupY, r, f.start, f.end);
+        ctxCup.closePath();
+        ctxCup.fillStyle = f.color;
+        ctxCup.fill();
+      });
+    }
+
+    drawCup();
+    toggleQuadrants.addEventListener("change", drawCup);
+
+    cupCanvas.addEventListener("click", (event) => {
+      const rect = cupCanvas.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      const dx = x - cupX;
+      const dy = y - cupY; // dy < 0 is toward top
+
+      const r = Math.hypot(dx, dy);
+
+      let result;
+      if (r <= cupRadius) {
+        result = "Made";
+      } else {
+        if (Math.abs(dx) > Math.abs(dy)) {
+          result = dx > 0 ? "Miss Right" : "Miss Left";
+        } else {
+          // Long on TOP (dy < 0), Short on BOTTOM (dy > 0)
+          result = dy < 0 ? "Long" : "Short";
+        }
+      }
+      logPutt(result, dx, dy);
+    });
+
+    /* =========================
+       Charts (pie + quadrant bar only)
+       ========================= */
+    const missCtx = document.getElementById('missChart').getContext('2d');
+    const missChart = new Chart(missCtx, {
+      type: 'pie',
+      data: {
+        labels: ["Made", "Miss Left", "Miss Right", "Short", "Long"],
+        datasets: [{
+          data: [0,0,0,0,0],
+          // Only "Made" is green
+          backgroundColor: [
+            "#4caf50", // Made
+            "#9e9e9e", // Miss Left
+            "#2196f3", // Miss Right
+            "#ff9800", // Short
+            "#9c27b0"  // Long
+          ]
+        }]
+      },
+      options: { responsive: true }
+    });
+
+    const quadCtx = document.getElementById("quadBarChart").getContext("2d");
+    const quadBarChart = new Chart(quadCtx, {
+      type: "bar",
+      data: { labels: ["Left", "Right", "Short", "Long"], datasets: [{ label: "Miss count", data: [0,0,0,0] }] },
+      options: { responsive: true, scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } }
+    });
+
+    /* =========================
+       Club management
+       ========================= */
+    function renderClubSelect() {
+      clubSelect.innerHTML = "";
+      // Add the All Clubs aggregate option at top
+      const allOpt = document.createElement("option");
+      allOpt.value = ALL; allOpt.textContent = "All Clubs (aggregate)";
+      clubSelect.appendChild(allOpt);
+
+      clubs.forEach(c => {
+        const opt = document.createElement("option");
+        opt.value = c; opt.textContent = c;
+        if (c === activeClub) opt.selected = true;
+        clubSelect.appendChild(opt);
+      });
+
+      // If active is not in list (e.g., ALL), select it
+      if (activeClub === ALL) clubSelect.value = ALL;
+
+      activeClubLabel.textContent = (activeClub === ALL) ? "All Clubs (aggregate)" : activeClub;
+      saveClubs(); // stores club list + active club (if real club)
+    }
+
+    function addClub(name) {
+      const clean = name.trim();
+      if (!clean) return;
+      if (clubs.includes(clean)) { alert("That club already exists."); return; }
+      clubs.push(clean);
+      activeClub = clean;
+      renderClubSelect();
+      updateDisplay();
+    }
+
+    function deleteClub(name) {
+      if (name === ALL) { alert("Select a specific club to delete."); return; }
+      if (clubs.length === 1) { alert("You must keep at least one club."); return; }
+      if (!confirm(`Delete club "${name}" and ALL its recorded putts? This cannot be undone.`)) return;
+
+      // Remove putts for this club
+      putts = putts.filter(p => p.club !== name);
+      // Remove club and set a safe active club
+      clubs = clubs.filter(c => c !== name);
+      activeClub = clubs[0];
+      renderClubSelect();
+      saveAll();
+      updateDisplay();
+    }
+
+    clubSelect.addEventListener("change", () => {
+      const val = clubSelect.value;
+      activeClub = val;
+      if (val !== ALL) localStorage.setItem("activeClub", activeClub);
+      activeClubLabel.textContent = (activeClub === ALL) ? "All Clubs (aggregate)" : activeClub;
+      updateDisplay();
+    });
+
+    addClubBtn.addEventListener("click", () => {
+      addClub(newClubInput.value);
+      newClubInput.value = "";
+    });
+
+    deleteClubBtn.addEventListener("click", () => deleteClub(activeClub));
+
+    /* =========================
+       Logging, rendering, storage
+       ========================= */
+    function logPutt(result, dx=null, dy=null) {
+      const distance = parseInt(document.getElementById("distance").value) || "?";
+      const putt = {
+        distance, result, time: new Date().toLocaleString(),
+        club: (activeClub === ALL ? (clubs[0] || "Default") : activeClub), // avoid saving under ALL
+        dx: dx, dy: dy
+      };
+      putts.push(putt);
+      saveAll();
+      updateDisplay();
+    }
+
+    function filteredPutts() {
+      if (activeClub === ALL) return putts.slice();
+      return putts.filter(p => p.club === activeClub);
+    }
+
+    function computeMissCounts(arr) {
+      const base = { "Made":0, "Miss Left":0, "Miss Right":0, "Short":0, "Long":0 };
+      arr.forEach(p => { if (base[p.result] !== undefined) base[p.result]++; });
+      return base;
+    }
+
+    function pct(makes, attempts) {
+      return attempts > 0 ? ((makes / attempts) * 100).toFixed(1) + "%" : "-";
+    }
+
+    function updateDisplay() {
+      drawCup(); // respect quadrant toggle
+      const data = filteredPutts();
+
+      // Pie
+      const counts = computeMissCounts(data);
+      missChart.data.datasets[0].data = [
+        counts["Made"], counts["Miss Left"], counts["Miss Right"], counts["Short"], counts["Long"]
+      ];
+      missChart.update();
+
+      // Distance stats (current view)
+      const tbody = document.getElementById("distanceStats");
+      tbody.innerHTML = "";
+      trackedDistances.forEach(d => {
+        const attempts = data.filter(p => p.distance === d).length;
+        const makes = data.filter(p => p.distance === d && p.result === "Made").length;
+        const row = `<tr><td>${d} ft</td><td>${makes}</td><td>${attempts}</td><td>${pct(makes, attempts)}</td></tr>`;
+        tbody.innerHTML += row;
+      });
+
+      // Quadrant bar: Left/Right/Short/Long (misses only)
+      quadBarChart.data.datasets[0].data = [
+        counts["Miss Left"], counts["Miss Right"], counts["Short"], counts["Long"]
+      ];
+      quadBarChart.update();
+
+      // Per-Club Comparison
+      renderClubComparison();
+
+      activeClubLabel.textContent = (activeClub === ALL) ? "All Clubs (aggregate)" : activeClub;
+    }
+
+    function renderClubComparison() {
+      const body = document.getElementById("clubCompareBody");
+      body.innerHTML = "";
+
+      // Ensure we have an up-to-date unique club list derived from data as well
+      const allClubNames = Array.from(new Set(clubs.concat(putts.map(p => p.club)))).sort((a,b)=>a.localeCompare(b));
+
+      allClubNames.forEach(club => {
+        const rows = putts.filter(p => p.club === club);
+        const totalAttempts = rows.length;
+        const totalMakes = rows.filter(p => p.result === "Made").length;
+
+        // Distance buckets
+        const dStats = {};
+        [2,4,6,8].forEach(d => {
+          const att = rows.filter(p => p.distance === d).length;
+          const mk = rows.filter(p => p.distance === d && p.result === "Made").length;
+          dStats[d] = { att, mk };
+        });
+
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${club}</td>
+          <td>${totalMakes}</td>
+          <td>${totalAttempts}</td>
+          <td>${pct(totalMakes, totalAttempts)}</td>
+          <td>${pct(dStats[2].mk, dStats[2].att)}</td>
+          <td>${pct(dStats[4].mk, dStats[4].att)}</td>
+          <td>${pct(dStats[6].mk, dStats[6].att)}</td>
+          <td>${pct(dStats[8].mk, dStats[8].att)}</td>
+        `;
+        body.appendChild(tr);
+      });
+    }
+
+    function exportData() {
+      const data = filteredPutts();
+      const nameForFile = (activeClub === ALL) ? "All_Clubs" : activeClub;
+      let csv = "Club,Distance,Result,Time,dx,dy\n";
+      data.forEach(p => {
+        csv += `${p.club},${p.distance},${p.result},${p.time},${p.dx ?? ""},${p.dy ?? ""}\n`;
+      });
+      const blob = new Blob([csv], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `putt-stats-${nameForFile.replace(/\s+/g,'_')}.csv`;
+      a.click();
+    }
+
+    function resetCurrentClub() {
+      if (activeClub === ALL) { alert("Switch to a specific club to reset its stats."); return; }
+      if (!confirm(`Reset all stats for "${activeClub}"? This deletes all its putts.`)) return;
+      putts = putts.filter(p => p.club !== activeClub);
+      saveAll();
+      updateDisplay();
+    }
+
+    function saveClubs() {
+      localStorage.setItem("clubs", JSON.stringify(clubs));
+      if (activeClub !== ALL) localStorage.setItem("activeClub", activeClub);
+    }
+
+    function saveAll() {
+      localStorage.setItem("putts_v2", JSON.stringify(putts));
+      saveClubs();
+    }
+
+    // Migrate old storage (optional)
+    function migrateOldData() {
+      const oldPutts = JSON.parse(localStorage.getItem("putts")) || [];
+      const migrated = oldPutts.map(p => ({
+        distance: typeof p.distance === "number" ? p.distance : parseInt(p.distance) || "?",
+        result: p.result,
+        time: p.time || new Date().toLocaleString(),
+        club: "Default",
+        dx: null, dy: null
+      }));
+      localStorage.setItem("putts_v2", JSON.stringify(migrated));
+      return migrated;
+    }
+
+    // Wire up buttons
+    resetClubBtn.addEventListener("click", resetCurrentClub);
+    exportBtn.addEventListener("click", exportData);
+
+    // Initial render
+    renderClubSelect();
+    updateDisplay();
+  </script>
+</body>
+</html>
